@@ -1,6 +1,6 @@
 """向量库：真实用 pgvector；没配 DATABASE_URL 时用内存版跑通链路。
 
-pgvector 要点（面试可讲）：
+pgvector 要点：
 - 表结构见 init_db.sql：embedding vector(512)，维度要与嵌入模型一致。
 - 检索用余弦距离运算符 <=>，相似度 = 1 - 距离。
 - 建议对 embedding 列建 ivfflat / hnsw 索引（数据量上来后必做）。
@@ -33,7 +33,7 @@ class MemoryVS:
 class PgVectorVS:
     """pgvector 版：依赖 psycopg 与已创建的表 rag_chunks（见 init_db.sql）。
 
-    向量入参处理（关键，面试可讲）：
+    向量入参处理（关键）：
     - 优先用 pgvector 官方适配器 register_vector，可直接传 numpy 数组；
     - 若没装 pgvector 包，则退化成把向量序列化成 '[v1,v2,...]' 字符串再 ::vector 强转，
       两种方式都能正确写入/检索，避免 psycopg 把 list 当成普通数组报错。

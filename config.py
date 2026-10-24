@@ -1,9 +1,9 @@
 """统一配置：全部走环境变量，方便本地开发与 Docker 部署切换。
 
-关键设计（面试可讲）：
+关键设计：
 - 不配 DATABASE_URL 时用内存向量库跑通链路，配了就走真实 pgvector，体现"可切换"。
 - 不配 REDIS_URL 时用 fakeredis，配了走真实 Redis。
-- EMBED_BACKEND=hash 是离线兜底，仅用于无模型时验证流程，不能用来写简历指标。
+- EMBED_BACKEND=hash 是离线兜底，仅用于无模型时验证流程，指标不具备参考价值。
 """
 import os
 from dataclasses import dataclass

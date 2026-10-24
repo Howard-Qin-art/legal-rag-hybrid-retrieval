@@ -1,6 +1,6 @@
 """法律语料与评测集（真实数据，来源见 law_qa_zh_600.json 的 _meta 字段）。
 
-设计思路（面试可讲）：
+设计思路：
 - 语料 CORPUS：用每条数据的 `output`（法律回答）作为可检索段落，去重后入库。
 - 评测 EVAL_SET：用 `instruction`（法律问句）作为 query，该问句对应 output 的语料 id 即
   为 gold（正确答案段落）。这样无需人工标注就得到 query -> gold passage 的检索评测集。

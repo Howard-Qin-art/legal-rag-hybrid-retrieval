@@ -1,6 +1,6 @@
 """Redis 缓存：相同查询直接复用检索结果，省掉 embedding 与检索开销。
 
-面试可讲点：缓存 key 怎么设计（查询+topk+是否重排）、TTL 为什么设短、
+设计要点：缓存 key 怎么设计（查询+topk+是否重排）、TTL 为什么设短、
 未配 Redis 时用 fakeredis 兜底保证可运行。
 """
 import json
