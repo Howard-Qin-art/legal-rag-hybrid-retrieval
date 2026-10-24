@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+rank_bm25
+psycopg[binary]
+redis
+fakeredis
+# 可选：真实句向量与重排需要（会拉 torch，体积较大，离线可先不装，代码会自动回退）
+# sentence-transformers

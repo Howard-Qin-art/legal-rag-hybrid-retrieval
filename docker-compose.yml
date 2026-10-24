@@ -1,0 +1,33 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      # 真实句向量需要 torch，改成 true 后重新 build（镜像会大很多）
+      args:
+        WITH_TORCH: "false"
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/rag
+      REDIS_URL: redis://redis:6379/0
+      EMBED_BACKEND: st
+      EMBED_MODEL: BAAI/bge-small-zh-v1.5
+      DATA_MODULE: data_law
+    depends_on:
+      - db
+      - redis
