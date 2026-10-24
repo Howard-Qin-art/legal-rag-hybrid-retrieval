@@ -1,135 +1,67 @@
-# Legal RAG Hybrid Retrieval · 法律领域 RAG 混合检索服务
+# legal-rag-hybrid-retrieval
 
-一个面向中文法律文本的**检索后端**：BM25 稀疏检索 + 向量稠密检索 → RRF 融合 → Cross-Encoder 重排，
-底层接 pgvector，上层是 FastAPI 服务 + Redis 查询缓存，并附带一套可复现的离线评测。
+中文法律文本的混合检索后端。BM25 和向量各召回一路，用 RRF 合一下，再用 Cross-Encoder 把前几条候选重排一遍。向量存 pgvector，服务是 FastAPI，查询结果丢 Redis 缓存。
 
-> 核心结论：**在法律文本上 BM25 单路的 Recall@1 比纯向量高 4.7 个点；
-> 混合 + 重排比纯向量高 6.0 个点。** 纯向量检索并不是万能解，本项目用数据量化了这个差距。
+写这个东西起因是不太信"向量检索一把梭"的说法。跑完数据发现确实不能一把梭 —— 至少在法律文本上不行，BM25 单路的 Recall@1 比纯向量高了 4.7 个点。下面表格里的数都是真跑出来的，`python evaluate.py` 能复现。
 
----
+## 结果
 
-## 一、项目要解决什么
+3000 段语料，150 条问句，嵌入用 `BAAI/bge-small-zh-v1.5`，重排用 `BAAI/bge-reranker-base`：
 
-通用 RAG 方案通常默认"向量检索就够了"，但在法律这类专业文本上，这个假设并不成立：
-法条编号、罪名、程序名是**强精确匹配**信号（"第二百九十四条"不该被语义泛化成"某条规定"），
-而向量检索倾向于语义泛化，反而会把精确信号稀释掉。
+|              | Recall@1 | Recall@5 | MRR   |
+| ------------ | -------: | -------: | ----: |
+| BM25         |    0.900 |    0.980 | 0.938 |
+| 向量          |    0.853 |    0.953 | 0.905 |
+| 混合 RRF      |    0.907 |    0.987 | 0.942 |
+| 混合 + 重排    |    0.913 |    0.987 | 0.947 |
 
-本项目做的是把四种检索方案放在同一份真实语料、同一批评测问句上横向对比，
-看清楚每种方案的边界，并把效果最好的一条链路做成可调用的 HTTP 服务。
+几个值得一说的点：
 
-| 目标 | 说明 | 状态 |
-| --- | --- | --- |
-| 量化方案差异 | 4 种检索方案对比，指标用 Recall@1 / Recall@5 / MRR | ✅ |
-| 工程可用 | 不是 notebook demo，能起服务、能切真实向量数据库 | ✅ FastAPI + pgvector + Redis + Docker |
-| 数据可信 | 语料与评测集来自真实数据集，可一键复现 | ✅ 3000 段语料 + 150 条真实问句 |
-| 结果可复现 | 报告中的每个数字都能用一条命令重跑出来 | ✅ `python evaluate.py` |
+法律文本里 BM25 反而赢过纯向量，一开始有点意外，想想也合理 —— 法条编号、罪名、程序名这些东西要的是精确匹配，语义模型擅长泛化，在这儿等于把信号稀释了。
 
----
+两路融合能涨到 0.907，说明它俩犯的错不是同一类，确实是互补的。真要是一路强一路弱到没贡献，融合只会拖后腿。
 
-## 二、效果
+重排只多了 0.6 个点，比预期低。原因在 Recall@5 上：已经 0.987 了，说明该召回的基本都召回来了，瓶颈压根不在排序。想继续提得动召回侧，换个更强的重排模型收益很小。这个结论是我改方向之前唯一觉得亏的地方 —— 重排模型 1.1GB，性价比一般。
 
-语料 **3000 段**，评测问句 **150 条**，嵌入 `BAAI/bge-small-zh-v1.5`（512 维），重排 `BAAI/bge-reranker-base`：
+## 怎么跑起来
 
-| 方法 | Recall@1 | Recall@5 | MRR |
-| --- | ---: | ---: | ---: |
-| BM25（稀疏） | 0.900 | 0.980 | 0.938 |
-| 向量（稠密） | 0.853 | 0.953 | 0.905 |
-| 混合 RRF | 0.907 | 0.987 | 0.942 |
-| **混合 + 重排** | **0.913** | **0.987** | **0.947** |
-
-从数据里读出来的三点：
-
-1. **法律场景下 BM25（0.900）强于纯向量（0.853）** —— 术语与法条编号依赖精确匹配，语义向量在此反而是劣势。
-2. **RRF 融合提升到 0.907** —— 说明两路检索的命中的错误是互补的，不是重叠的，融合确实拿到了增量。
-3. **重排再提升到 0.913，但涨幅收窄（+0.6）** —— 因为 Recall@5 已达 0.987，瓶颈在"召回"而非"排序"；
-   继续优化应该往召回侧投入，而不是堆更贵的重排模型。
-
-指标撞天花板的问题及处理方式记录在[已知问题](#七已知问题与处理记录)第 ④ 条。
-
----
-
-## 三、整体流程
-
-```mermaid
-flowchart TD
-    A["① 数据获取<br/>HuggingFace datasets-server<br/>Brench/chinese_law_data_rag_ft<br/>281,142 行"]
-    A -->|"scripts/fetch_law_data.py<br/>取 3000 条"| B["law_qa_zh_3000.json"]
-    B --> C["② 语料与评测集构建<br/>output → CORPUS（去重后作为可检索段落）<br/>instruction → EVAL_SET（问句）<br/>问句对应 output 的段落 id 即 gold"]
-    C --> D["③ 索引构建<br/>bge-small-zh 编码 3000 段 → 512 维<br/>写入 pgvector rag_chunks<br/>同时构建 BM25 倒排"]
-    D --> E["④ 在线检索<br/>BM25 Top-10 ＋ 向量 Top-10"]
-    E --> F["RRF 融合<br/>score = Σ 1/(60 + rank)"]
-    F --> G["Cross-Encoder 重排<br/>只对 10 条候选做"]
-    G --> H["Top-K 返回 + 写 Redis 缓存"]
-    C --> I["⑤ 离线评测<br/>evaluate.py 跑 4 种方案<br/>输出 Recall@1 / Recall@5 / MRR"]
-```
-
-**请求视角的检索链路**
-
-```
-POST /retrieve
-  ├─ Redis 命中？ → 直接返回（cached=true）
-  ├─ BM25.search(q, 10)   ─┐
-  ├─ Vector.search(q, 10) ─┴→ rrf_fuse(k=60) → 10 条候选
-  ├─ 可选：CrossEncoder 重排 → Top-K
-  └─ 写回 Redis（TTL 600s）
-```
-
----
-
-## 四、快速开始
-
-### 方式 A：零依赖跑通（不需要模型、不需要数据库）
+不装模型不装数据库也能先把链路跑通，用的是哈希兜底嵌入加 20 段示例语料，**这个模式下的指标没有参考价值**，只是验证代码没坏：
 
 ```bash
 pip install -r requirements.txt
 EMBED_BACKEND=hash DATA_MODULE=data python evaluate.py
 ```
 
-使用哈希兜底嵌入 + 内置 20 段示例语料，**仅用于验证链路连通性，指标不具备参考价值**。
-
-### 方式 B：本地完整效果（产出上表的方式）
+要出上面表格里的数，得把真家伙拉起来：
 
 ```bash
-# 1) 起中间件（pgvector + redis）
+# 起 pgvector 和 redis
 docker compose up -d db redis
 
-# 2) 装模型依赖（torch 较大，约 2GB）
+# torch 比较大，2GB 左右
 pip install sentence-transformers
 
-# 3) 跑评测（Windows PowerShell）
+# Windows PowerShell
 $env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/rag"
 $env:DATA_MODULE  = "data_law"
 $env:RERANK_MODEL = "BAAI/bge-reranker-base"
 python evaluate.py
 
-# 4) 起服务，浏览器打开 http://localhost:8000
+# 起服务
 uvicorn main:app --reload --port 8000
 ```
 
-> `init_db.sql` 会在 db 容器首次启动时自动执行（已挂载到 `docker-entrypoint-initdb.d`），无需手动建表。
-> 更换嵌入模型时必须同步修改 `init_db.sql` 中的 `vector(512)` 维度。
+macOS / Linux 把 `$env:XXX = "..."` 换成 `export XXX="..."` 就行。
 
-### 方式 C：全 Docker
+`init_db.sql` 挂在 `docker-entrypoint-initdb.d` 上，db 容器第一次起来会自动建表，不用手动执行。但要注意：换嵌入模型一定得同步改 `init_db.sql` 里的 `vector(512)`，维度对不上会直接报错。
 
-```bash
-docker compose up --build
-```
-
-`api` 镜像默认不含 torch，需要真实句向量时重新构建：
-
-```bash
-docker compose build --build-arg WITH_TORCH=true api
-```
-
-### 接口
+调接口：
 
 ```bash
 curl -X POST http://localhost:8000/retrieve \
   -H "Content-Type: application/json" \
   -d '{"query": "如果被告人不服判决，有什么权利？", "topk": 3, "use_rerank": true}'
 ```
-
-返回：
 
 ```json
 {
@@ -140,134 +72,82 @@ curl -X POST http://localhost:8000/retrieve \
 }
 ```
 
----
+浏览器打开 `http://localhost:8000` 有个能直接输问题的演示页。
 
-## 五、环境变量
+全部 Docker 化是 `docker compose up --build`，但 api 镜像默认不含 torch，需要真嵌入时得 `docker compose build --build-arg WITH_TORCH=true api`，镜像会大不少。
 
-复制 `.env.example` 为 `.env` 后按需修改。所有变量都有降级默认值，不配置也能运行。
+## 数据是哪来的
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `DATABASE_URL` | 空 | 空 → 内存向量库；填 → 真实 pgvector |
-| `REDIS_URL` | 空 | 空 → fakeredis；填 → 真实 Redis |
-| `EMBED_BACKEND` | `st` | `st` 真实句向量 / `hash` 离线兜底 |
-| `EMBED_MODEL` | `BAAI/bge-small-zh-v1.5` | 512 维，换模型需同步改表结构 |
-| `RERANK_MODEL` | 空 | 空 → 跳过重排；`BAAI/bge-reranker-base` |
-| `DATA_MODULE` | `data` | `data_law` 法律语料 / `data` 示例语料 |
-| `TOPK` / `EVAL_MAX` | `5` / `150` | 返回条数 / 评测问句条数 |
+语料来自 HuggingFace 上的 [Brench/chinese_law_data_rag_ft](https://huggingface.co/datasets/Brench/chinese_law_data_rag_ft)，28 万多条中文法律问答，我取了前 3000 条存成 `law_qa_zh_3000.json`，文件里的 `_meta` 字段写了来源和字段含义。想重新抓或者换数量：
 
-Windows 环境请额外设置 `HF_HUB_DISABLE_SYMLINKS=1`，原因见[已知问题](#七已知问题与处理记录)第 ① 条。
-
----
-
-## 六、目录结构
-
-```
-├── config.py              统一配置，全部走环境变量
-├── embedding.py           嵌入层：sentence-transformers / 哈希兜底，含中文切分
-├── vectorstore.py         向量库：pgvector（psycopg3 + register_vector）/ 内存版
-├── retrievers.py          BM25 + 向量 + RRF 融合 + Cross-Encoder 重排
-├── cache.py               Redis 查询缓存（key = query:topk:use_rerank，TTL 600s）
-├── main.py                FastAPI 服务：/retrieve、/health、演示页
-├── evaluate.py            四种方案横向评测，输出 Recall@1 / Recall@5 / MRR
-├── data_law.py            法律语料与评测集构建（output→语料，instruction→问句）
-├── data.py                内置 20 段示例语料（零依赖演示用）
-├── law_qa_zh_3000.json    真实语料（含 _meta 标注来源与字段含义）
-├── scripts/fetch_law_data.py   从 HuggingFace 重新抓取语料，保证数据可复现
-├── init_db.sql            pgvector 建表（vector(512)，含 HNSW 索引建议）
-├── Dockerfile / docker-compose.yml
-└── .env.example
+```bash
+python scripts/fetch_law_data.py              # 默认 3000 条
+TARGET_ROWS=10000 python scripts/fetch_law_data.py
 ```
 
----
+脚本走的是 datasets-server 的 HTTP 接口，不用装 datasets 也不用 git-lfs，比较省事。
 
-## 七、关键设计决策
+评测集是白捡的。数据本身是问答对，那就把**回答当作语料段落**、**问句当作 query**，这条问句对应的回答，段落 id 天然就是 gold。零标注成本拿到 query-passage 对。前提是问句是自然语言而不是原文关键词的拷贝，否则两路都能秒中，做出来的指标毫无意义 —— 这一点在下面的坑里还会提到。
 
-**1. 融合为什么用 RRF 而不是加权求和**
+## 几个设计上的选择
 
-BM25 分数是 TF-IDF 量纲（数值可能到几十），向量相似度是 0~1，两者不可直接比较。
-加权求和需要先做归一化，而归一化系数对语料分布敏感，换一批数据就要重新调。
-RRF 只使用名次：`score = Σ 1/(60 + rank)`，天然跨量纲，无需调参，工程上更稳定。
+**融合为什么用 RRF。** BM25 的分数是 TF-IDF 量纲，能到几十；向量相似度是 0~1。两边加起来之前得先归一化，而归一化系数对语料分布特别敏感，换批数据就得重调。RRF 只看名次，`score = Σ 1/(60 + rank)`，天生跨量纲，也不用调参。省事且稳。
 
-**2. 重排为什么只做第二阶段**
+**重排为什么放在第二阶段。** Cross-Encoder 要把 query 和 doc 拼一起完整过一遍 BERT，精度是高，但每条候选都要一次前向。3000 段全量重排就是 3000 次前向，延迟没法看。所以先用便宜的方式召回 10 条，再用贵的模型排这 10 条。两阶段，工业上都这么干。
 
-Cross-Encoder 把 query 与 doc 拼接后完整过一遍 BERT，精度高但每次都要一次前向计算。
-对 3000 段全量重排等于 3000 次前向，延迟不可接受。
-因此采用两阶段：先用低成本方式（BM25 + 向量）召回 10 条，再用高成本模型精排这 10 条。
+**缓存 key 带上 topk 和 use_rerank。** 拼成 `rag:{query}:{topk}:{use_rerank}`。少任何一个字段，不同参数的检索结果就会互相串味。TTL 设的是 600 秒，知识库更新之后旧结果得尽快失效 —— 多算一次检索的成本，比返回过期法条低得多。
 
-**3. 评测集如何在零标注成本下构造**
+**到处留了降级。** 没配 `DATABASE_URL` 就用内存向量库，没配 `REDIS_URL` 就用 fakeredis，模型加载失败就回退哈希嵌入。好处是换台机器装上 requirements 就能跑，不会被环境卡住。坏处是会**静默降级出一版假指标**，所以 `evaluate.py` 每次都会打印当前用的是哪种嵌入后端，看到 `hash` 就别当真。
 
-数据集本身是问答对，于是：**回答 = 语料段落**，**问句 = 评测 query**，
-问句所对应回答的段落 id 天然就是 gold。由此零成本得到 query-passage 评测对。
-前提是该问句必须是自然语言表述而非原文关键词拷贝，否则两路检索都会满分、失去区分度。
+## 踩过的坑
 
-**4. 缓存 key 的设计**
+**Windows 下 HF 缓存把 config.json 弄成 0 字节。** 报 `OSError: config file is not a valid JSON`，我一开始以为是网不好，重试好几遍。实际是符号链接：HF 用 symlink 把 `snapshots/` 指到 `blobs/`，Windows 没开开发者模式时创建失败，退化成空文件。解决办法是删掉坏缓存，然后 `HF_HUB_DISABLE_SYMLINKS=1` 重新下载（改成复制而非链接）。Windows 用户建议直接把这条写进环境变量。
 
-`rag:{query}:{topk}:{use_rerank}` —— 三个字段缺一不可，否则不同参数的检索结果会互相串味。
-TTL 设为 600 秒：知识库更新后旧结果要尽快失效，返回过期内容的代价远高于多算一次检索。
+**模型在本地却加载不出来。** 同上联网校验的问题，网络不通时报 502，代码 catch 住然后悄悄回退哈希嵌入 —— 指标看着挺正常，其实是假的。设 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1` 走离线加载。
 
-**5. 为什么要做降级设计**
+**psycopg3 写向量报类型错误。** Python list 不能直接丢给 `vector` 列。优先用 `pgvector.psycopg.register_vector`（能直接吃 numpy 数组），没装这个包就退化成拼 `'[v1,v2,...]'` 字符串再 `::vector` 强转，两条路都验过。
 
-未配置 `DATABASE_URL` 时用内存向量库，未配置 `REDIS_URL` 时用 fakeredis，模型加载失败时回退哈希嵌入。
-好处是任何机器上 `pip install -r requirements.txt` 后都能立刻跑通，不被环境卡住。
-代价是可能出现"静默降级出假指标"，因此 `evaluate.py` 每次运行都会打印当前嵌入后端，提示结果是否可采信。
+**指标天花板，这个是坑里最深的。** 语料 20 段的时候，四种方案 Recall 全是 1.000。扩到 600 段，还是普遍 0.98+，完全分不出高下。查下来是两个原因：语料太少，以及评测问句写得太像原文关键词，等于给两路都送分。最后把语料加到 3000 段、指标换成更难的 Recall@1、问句用真实自然语言，才拿到有区分度的数。**教训是：指标全满分时先怀疑天花板，别急着调模型。**
 
----
+**换嵌入模型忘了改表。** `bge-small-zh-v1.5` 是 512 维，`init_db.sql` 里就得写 `vector(512)`。换 `bge-base-zh` 是 768 维，不改表直接报错。
 
-## 八、已知问题与处理记录
+## 环境变量
 
-均为实际开发中遇到并已解决的问题，记录于此便于复现和维护。
+复制 `.env.example` 改成 `.env` 就行，全部都有降级默认值，一个不配也能跑。
 
-**① Windows + HuggingFace 符号链接导致 `config.json` 0 字节**
+| 变量                | 默认                     | 说明                                  |
+| ------------------- | ------------------------ | ------------------------------------- |
+| `DATABASE_URL`      | 空                       | 空则内存向量库，填了走真实 pgvector    |
+| `REDIS_URL`         | 空                       | 空则 fakeredis，填了走真实 Redis       |
+| `EMBED_BACKEND`     | `st`                     | `st` 真实句向量 / `hash` 离线兜底      |
+| `EMBED_MODEL`       | `BAAI/bge-small-zh-v1.5` | 512 维，换模型要同步改表               |
+| `RERANK_MODEL`      | 空                       | 空则跳过重排                           |
+| `DATA_MODULE`       | `data`                   | `data_law` 法律语料 / `data` 示例语料  |
+| `TOPK` / `EVAL_MAX` | `5` / `150`              | 返回条数 / 评测问句条数                |
 
-报错 `OSError: config file is not a valid JSON`。排查确认不是网络问题：
-HF 用 symlink 将 `snapshots/` 指向 `blobs/`，Windows 未开启开发者模式时创建失败，会退化成空文件。
-处理：删除损坏缓存后设置 `HF_HUB_DISABLE_SYMLINKS=1` 重新下载（改为复制而非链接）。
+## 代码结构
 
-**② sentence-transformers 静默降级**
+```
+config.py              配置，全走环境变量
+embedding.py           嵌入层，含中文切分和 hash 兜底
+vectorstore.py         pgvector / 内存，两种向量库
+retrievers.py          BM25、向量、RRF 融合、重排
+cache.py               Redis 查询缓存
+main.py                FastAPI：/retrieve、/health、演示页
+evaluate.py            四方案评测，输出 Recall@1/@5、MRR
+data_law.py            法律语料与评测集构建
+data.py                20 段示例语料
+scripts/fetch_law_data.py   重新抓语料
+init_db.sql            建表语句
+```
 
-模型已在本地缓存，但默认会联网校验；网络不通时报 502 后自动回退哈希嵌入，
-此时指标看似正常实际无效。处理：设置 `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` 走离线加载。
+## 还没做
 
-**③ psycopg3 写入向量报类型错误**
-
-直接把 Python list 传给 `vector` 列会失败。处理：优先使用 `pgvector.psycopg.register_vector`
-（可直接传 numpy 数组）；未安装该包时退化为 `'[v1,v2,...]'::vector` 字符串强转，两种方式均已验证可用。
-
-**④ 指标天花板效应（影响最大的一条）**
-
-语料 20 段时四种方案指标**全部为 1.000**；扩到 600 段仍普遍 0.98+，毫无区分度。
-原因是语料规模太小，且评测问句接近原文关键词，两路检索都能轻易命中。
-处理：语料扩至 3000 段 + 增加 **Recall@1**（比 Recall@5 更难，能拉开差距）+ 使用真实自然语言问句，
-最终得到有区分度的结果。**经验：指标全满分时，先检查天花板，而不是急着调模型。**
-
-**⑤ 更换嵌入模型需同步修改表结构**
-
-`bge-small-zh-v1.5` 输出 512 维，`init_db.sql` 中必须对应 `vector(512)`。
-换成 `bge-base-zh`（768 维）不改表结构会直接报错。
-
----
-
-## 九、数据来源
-
-- 数据集：[Brench/chinese_law_data_rag_ft](https://huggingface.co/datasets/Brench/chinese_law_data_rag_ft)（281,142 条中文法律问答）
-- 本仓库取前 3000 条，存为 `law_qa_zh_3000.json`（文件内 `_meta` 字段标注了来源、字段含义与用途）
-- 重新抓取：`python scripts/fetch_law_data.py`（可用 `TARGET_ROWS` 调整条数）
-- 嵌入模型：`BAAI/bge-small-zh-v1.5`；重排模型：`BAAI/bge-reranker-base`
-
----
-
-## 十、后续计划
-
-当前检索链路已完整可用，以下部分尚未实现：
-
-- **文本切分**：目前直接使用整段回答作为检索单元，长文档场景需要 chunk + overlap
-- **向量索引**：HNSW 索引未启用（`init_db.sql` 中留有注释语句），3000 段规模下全表扫描更快
-- **生成环节**：目前只做到检索层，未接入 LLM 生成最终答案
-- **多租户隔离**：未实现 tenant_id + 行级安全策略
-
----
+- 文本切分：现在直接拿整段回答当检索单元，长文档得上 chunk + overlap
+- 向量索引：HNSW 没开，语句在 `init_db.sql` 注释里。3000 段这规模全表扫描更快，开了反而慢
+- 生成环节：只做到检索层，没接 LLM 出答案，严格说现在是 R 不是完整的 RAG
+- 多租户：没做隔离
 
 ## License
 
-[MIT](LICENSE)
+MIT
