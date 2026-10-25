@@ -61,6 +61,8 @@ uvicorn main:app --reload --port 8000
 
 macOS / Linux 把 `$env:XXX = "..."` 换成 `export XXX="..."` 就行。
 
+第一次跑会把 3000 段全部编码写进 pgvector，之后库里有了就直接跳过，终端会打印一行 `[skip]`。换语料但条数正好撞上时，记得 `REUSE_INDEX=0` 强制重建，不然会拿旧向量出结果。这个复用只对 pgvector 生效，内存模式每次进程重启都得重算。
+
 `init_db.sql` 挂在 `docker-entrypoint-initdb.d` 上，db 容器第一次起来会自动建表，不用手动执行。但要注意：换嵌入模型一定得同步改 `init_db.sql` 里的 `vector(512)`，维度对不上会直接报错。
 
 调接口：
@@ -111,6 +113,16 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 
 **融合为什么用 RRF。** BM25 的分数是 TF-IDF 量纲，能到几十；向量相似度是 0~1。两边加起来之前得先归一化，而归一化系数对语料分布特别敏感，换批数据就得重调。RRF 只看名次，`score = Σ 1/(60 + rank)`，天生跨量纲，也不用调参。省事且稳。
 
+顺带交代一下那个 60 是怎么来的：RRF 原始论文里的默认值，而那篇用的是英文数据集。我一开始直接抄了，后来补了组消融（`scripts/ablate_rrf_k.py`）：
+
+| k        | Recall@1 | Recall@5 | MRR   |
+| -------- | -------: | -------: | ----: |
+| 1        |    0.900 |    0.987 | 0.938 |
+| 5        |    0.907 |    0.987 | 0.943 |
+| 10 ~ 200 |    0.907 |    0.987 | 0.942 |
+
+结论是这东西对 k 极不敏感：5 到 200 之间三个指标基本不动，只有小到 1 的时候会掉到 0.900，因为名次权重太陡，等于退化成只看第一名。所以 60 谈不上最优（k=5 时 MRR 高 0.001），但也不算拍错 —— 差在千分位上，与其纠结这个，不如把心思花在召回侧。换个角度说，参数不敏感本身就是 RRF 相对加权求和的优势。
+
 **重排为什么放在第二阶段。** Cross-Encoder 要把 query 和 doc 拼一起完整过一遍 BERT，精度是高，但每条候选都要一次前向。3000 段全量重排就是 3000 次前向，延迟没法看。所以先用便宜的方式召回 10 条，再用贵的模型排这 10 条。也就是召回和精排分开，做搜索的基本都这么拆，没什么新鲜的，但确实有效。
 
 **缓存 key 带上 topk 和 use_rerank。** 拼成 `rag:{query}:{topk}:{use_rerank}`。少任何一个字段，不同参数的检索结果就会互相串味。TTL 设的是 600 秒，知识库更新之后旧结果得尽快失效 —— 多算一次检索的成本，比返回过期法条低得多。
@@ -142,6 +154,7 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 | `RERANK_MODEL`      | 空                       | 空则跳过重排                           |
 | `DATA_MODULE`       | `data`                   | `data_law` 法律语料 / `data` 示例语料  |
 | `TOPK` / `EVAL_MAX` | `5` / `150`              | 返回条数 / 评测问句条数                |
+| `REUSE_INDEX`       | `1`                      | 库里已有同样条数时跳过重建，换语料要设 `0` |
 
 ## 代码结构
 
@@ -156,7 +169,15 @@ evaluate.py            四方案评测，输出 Recall@1/@5、MRR
 data_law.py            法律语料与评测集构建
 data.py                20 段示例语料
 scripts/fetch_law_data.py   重新抓语料
+scripts/ablate_rrf_k.py     RRF 的 k 值消融
+tests/test_reuse_index.py   索引复用的测试，mock 掉数据库，不用 Docker 也能跑
 init_db.sql            建表语句
+```
+
+测试这么跑，不用装 pytest：
+
+```bash
+python tests/test_reuse_index.py
 ```
 
 ## 还没做

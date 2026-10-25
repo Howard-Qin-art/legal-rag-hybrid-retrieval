@@ -1,9 +1,23 @@
-fastapi
-uvicorn
-numpy
-rank_bm25
-psycopg[binary]
-redis
-fakeredis
-# 可选：真实句向量与重排需要（会拉 torch，体积较大，离线可先不装，代码会自动回退）
-# sentence-transformers
+# 锁的是兼容区间而不是精确版本：既能拿到安全更新，又不会装到破坏兼容的大版本。
+# 下面这套是实测跑通并跑出 README 里那组指标的组合（Python 3.10）：
+#   fastapi 0.143 / uvicorn 0.52.4 / numpy 2.2.6 / rank-bm25 0.2.2
+#   psycopg 3.3.6 / pgvector 0.5.1 / redis 8.1.0
+#   sentence-transformers 6.1.0 / torch 2.5.1+cu121 / transformers 5.17.0
+
+# 服务
+fastapi>=0.143,<1.0
+uvicorn>=0.52,<1.0
+pydantic>=2.0,<3.0
+
+# 检索与向量
+numpy>=1.26,<3.0
+rank-bm25>=0.2.2,<0.3
+
+# 存储
+psycopg[binary]>=3.1,<4.0
+pgvector>=0.3,<1.0      # 用于 register_vector，没装也能跑（会退化成字符串强转）
+redis>=5.0,<9.0
+fakeredis>=2.20,<3.0    # 没配 REDIS_URL 时的本地兜底
+
+# 可选：真实句向量与重排。会拉 torch（约 2GB），离线可不装，代码会自动降级
+# sentence-transformers>=3.0,<7.0

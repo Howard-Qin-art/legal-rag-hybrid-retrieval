@@ -66,10 +66,17 @@ def rerank(reranker, query, candidates, docs_by_id, topk=5):
 
 
 def build_index(corpus):
-    """一次性构建：嵌入模型 + 向量库写入 + 两路检索器。"""
+    """一次性构建：嵌入模型 + 向量库写入 + 两路检索器。
+
+    向量库里已经有这批数据时（条数一致且 REUSE_INDEX 未关），跳过编码和写入，
+    否则每次跑评测都要把 3000 段重新过一遍模型再 upsert，纯属浪费。
+    """
     emb = get_embedding()
     vs = get_vectorstore(emb.dim)
     texts = [d["text"] for d in corpus]
-    # 把正文也写进库（pgvector 版会存到 content 列，内存版忽略）
-    vs.add([d["id"] for d in corpus], emb.encode(texts), texts=texts)
+    if vs.needs_build(len(corpus)):
+        # 把正文也写进库（pgvector 版会存到 content 列，内存版忽略）
+        vs.add([d["id"] for d in corpus], emb.encode(texts), texts=texts)
+    else:
+        print(f"[skip] 向量库已有 {len(corpus)} 行，跳过重建（换语料后设 REUSE_INDEX=0）")
     return emb, vs, BM25Retriever(corpus), VectorRetriever(vs, emb)

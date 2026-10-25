@@ -18,6 +18,9 @@ class MemoryVS:
         self.ids: list = []
         self.mat = None
 
+    def needs_build(self, n):
+        return True  # 内存版进程内重建，无所谓成本
+
     def add(self, ids, vecs, texts=None):
         self.ids = list(ids)
         self.mat = np.asarray(vecs, dtype="float32")
@@ -55,6 +58,20 @@ class PgVectorVS:
         if self._native:
             return arr
         return "[" + ",".join(f"{x:.6f}" for x in arr) + "]"
+
+    def count(self):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM rag_chunks")
+            return cur.fetchone()[0]
+
+    def needs_build(self, n):
+        """库里已有同样条数就认为索引是现成的，跳过编码与写入。"""
+        if not CONFIG.reuse_index:
+            return True
+        try:
+            return self.count() != n
+        except Exception:  # noqa: BLE001
+            return True  # 表还没建之类的情况，照常重建
 
     def add(self, ids, vecs, texts=None):
         rows = [

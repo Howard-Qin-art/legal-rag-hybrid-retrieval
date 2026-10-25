@@ -26,8 +26,12 @@ class Config:
 
     topk: int = int(os.getenv("TOPK", "5"))
 
-    # 语料模块：data=内置示例语料(20段)；data_law=本地真实法律问答语料(600条)
+    # 语料模块：data=内置示例语料(20段)；data_law=本地真实法律问答语料(3000条)
     data_module: str = os.getenv("DATA_MODULE", "data")
+
+    # 向量库里已有同样条数的向量时跳过重建，省掉重复的编码与写入
+    # 换语料但条数恰好相同时，设 REUSE_INDEX=0 强制重建
+    reuse_index: bool = os.getenv("REUSE_INDEX", "1") == "1"
 
 
 CONFIG = Config()
