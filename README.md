@@ -2,7 +2,9 @@
 
 中文法律文本的混合检索后端。BM25 和向量各召回一路，用 RRF 合一下，再用 Cross-Encoder 把前几条候选重排一遍。向量存 pgvector，服务是 FastAPI，查询结果丢 Redis 缓存。
 
-写这个东西起因是不太信"向量检索一把梭"的说法。跑完数据发现确实不能一把梭 —— 至少在法律文本上不行，BM25 单路的 Recall@1 比纯向量高了 4.7 个点。下面表格里的数都是真跑出来的，`python evaluate.py` 能复现。
+写这个的起因有点简单：我看过的 RAG 项目和教程里，检索这一层基本都是直接上一套向量检索就结束了，很少有人真的把关键词检索和向量检索放在同一份语料、同一批问题上比过。大家默认"向量能理解语义，所以一定比关键词强"，这个默认我一直不太信，于是想自己跑一遍看看差多少。
+
+结果是：至少在法律文本上，真不是这么回事。BM25 单路的 Recall@1 比纯向量高了 4.7 个点。下面表格里的数都是真跑出来的，`python evaluate.py` 一条命令能复现，不用光信我说的。
 
 ## 结果
 
@@ -32,22 +34,28 @@ pip install -r requirements.txt
 EMBED_BACKEND=hash DATA_MODULE=data python evaluate.py
 ```
 
-要出上面表格里的数，得把真家伙拉起来：
+要复现上面那张表，需要的东西比第一种模式多三样：
+
+- **pgvector 数据库**（5432）：存 3000 段语料的 512 维向量，用 Docker 起
+- **嵌入和重排模型**：本地能加载就行，可以现下，也可以像我这样提前下好放本地
+- **Redis**（6379）：只有跑 HTTP 服务时才用得上，单纯跑评测其实可以不起
 
 ```bash
-# 起 pgvector 和 redis
+# 1. 起 pgvector（db，5432）和 Redis（redis，6379）
+#    只跑评测的话，后面那个 redis 可以不加
 docker compose up -d db redis
 
-# torch 比较大，2GB 左右
+# 2. 装嵌入 + 重排模型依赖，会带上 torch，2GB 左右
 pip install sentence-transformers
 
-# Windows PowerShell
+# 3. 告诉程序连哪个库、用哪份语料（Windows PowerShell）
 $env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/rag"
 $env:DATA_MODULE  = "data_law"
 $env:RERANK_MODEL = "BAAI/bge-reranker-base"
 python evaluate.py
 
-# 起服务
+# 4. 起 FastAPI 服务（8000）。要用到缓存就再把 Redis 指过去
+$env:REDIS_URL = "redis://localhost:6379/0"
 uvicorn main:app --reload --port 8000
 ```
 
@@ -87,13 +95,15 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 
 脚本走的是 datasets-server 的 HTTP 接口，不用装 datasets 也不用 git-lfs，比较省事。
 
-评测集是白捡的。数据本身是问答对，那就把**回答当作语料段落**、**问句当作 query**，这条问句对应的回答，段落 id 天然就是 gold。零标注成本拿到 query-passage 对。前提是问句是自然语言而不是原文关键词的拷贝，否则两路都能秒中，做出来的指标毫无意义 —— 这一点在下面的坑里还会提到。
+评测集这块我一条都没自己标。数据本身就是问答对，那就换个用法：**回答当作语料段落**，**问句当作 query**，这条问句对应的那个回答，它的段落 id 天然就是 gold。于是一分钱不花就有了 query-passage 对。
+
+代价是有一个前提：问句得是自然语言表述，不能是原文关键词的拷贝。否则两路检索都能秒中，做出来的指标毫无意义 —— 这一点在下面的坑里还会提到。
 
 ## 几个设计上的选择
 
 **融合为什么用 RRF。** BM25 的分数是 TF-IDF 量纲，能到几十；向量相似度是 0~1。两边加起来之前得先归一化，而归一化系数对语料分布特别敏感，换批数据就得重调。RRF 只看名次，`score = Σ 1/(60 + rank)`，天生跨量纲，也不用调参。省事且稳。
 
-**重排为什么放在第二阶段。** Cross-Encoder 要把 query 和 doc 拼一起完整过一遍 BERT，精度是高，但每条候选都要一次前向。3000 段全量重排就是 3000 次前向，延迟没法看。所以先用便宜的方式召回 10 条，再用贵的模型排这 10 条。两阶段，工业上都这么干。
+**重排为什么放在第二阶段。** Cross-Encoder 要把 query 和 doc 拼一起完整过一遍 BERT，精度是高，但每条候选都要一次前向。3000 段全量重排就是 3000 次前向，延迟没法看。所以先用便宜的方式召回 10 条，再用贵的模型排这 10 条。也就是召回和精排分开，做搜索的基本都这么拆，没什么新鲜的，但确实有效。
 
 **缓存 key 带上 topk 和 use_rerank。** 拼成 `rag:{query}:{topk}:{use_rerank}`。少任何一个字段，不同参数的检索结果就会互相串味。TTL 设的是 600 秒，知识库更新之后旧结果得尽快失效 —— 多算一次检索的成本，比返回过期法条低得多。
 
