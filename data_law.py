@@ -36,7 +36,8 @@ for r in _rows:
 # 2) 用 instruction 构建评测集（gold = 对应 output 的语料 id）
 _raw_eval = []
 for r in _rows:
-    q = (r.get("instruction") or "").strip()
+    # 合并内部换行和连续空白：问句里带换行会让生成的标注表断行，解析回来就对不上了
+    q = " ".join((r.get("instruction") or "").split())
     text = (r.get("output") or "").strip()
     if not q or text not in _text_to_id:
         continue
