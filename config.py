@@ -9,6 +9,30 @@ import os
 from dataclasses import dataclass
 
 
+def _load_dotenv(path=None):
+    """把 .env 里的键值对塞进 os.environ，文件不存在就跳过。
+
+    没用 python-dotenv：就是一个 key=value 的解析，为此加一层依赖不划算。
+    已经存在的环境变量不覆盖 —— 命令行 export 的优先级应当高于 .env，
+    不然想临时换个模型还得去改文件。
+    """
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+_load_dotenv()
+
+
 @dataclass
 class Config:
     # PostgreSQL + pgvector，例如 postgresql://postgres:pwd@localhost:5432/rag
@@ -41,7 +65,13 @@ class Config:
     model_api_key: str = os.getenv("MODEL_API_KEY", "")  # 留空则 /ask 退化成纯检索
     model_name: str = os.getenv("MODEL_NAME", "qwen-plus")
     model_temperature: float = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
-    model_timeout: int = int(os.getenv("MODEL_TIMEOUT", "60"))
+    model_timeout: int = int(os.getenv("MODEL_TIMEOUT", "120"))
+
+    # 思考模式。默认关：实测 qwen3.5-plus 开着的时候，一个 46 字的答案配了
+    # 4286 字的思考过程，输出 token 从 30 涨到 1434，耗时从 3.3 秒涨到 28.5 秒。
+    # RAG 要的是照着资料归纳，不是推演，这笔开销纯属浪费。
+    # 想看模型的推理过程就设 MODEL_ENABLE_THINKING=1
+    model_enable_thinking: bool = os.getenv("MODEL_ENABLE_THINKING", "0") == "1"
     # 送进提示词的每段正文最长多少字，长了截断，省 token 也避免超出上下文
     passage_max_chars: int = int(os.getenv("PASSAGE_MAX_CHARS", "600"))
 

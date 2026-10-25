@@ -8,11 +8,17 @@
     python tests/test_generator.py
     EMBED_BACKEND=hash DATA_MODULE=data python tests/test_generator.py
 """
-import importlib
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 这两行必须在 import config 之前，因为配置是在 import 那一刻读的环境变量。
+# 别想着后面 importlib.reload(config) 补救 —— reload 会造出一个新的 CONFIG 对象，
+# 而 generator 里已经 import 走的还是旧对象，两个配置就此分家，
+# 测试里改了半天 key 其实改的是另一个对象。这个坑我自己踩过一次。
+os.environ.setdefault("EMBED_BACKEND", "hash")
+os.environ.setdefault("DATA_MODULE", "data")
 
 import generator  # noqa: E402
 from config import CONFIG  # noqa: E402
@@ -33,13 +39,17 @@ def check(name, cond, extra=""):
 
 
 def test_no_key_returns_none():
-    """没配 key 必须返回 None，让调用方退回纯检索，而不是抛异常。"""
-    old = CONFIG.model_api_key
-    CONFIG.model_api_key = ""
+    """没配 key 必须返回 None，让调用方退回纯检索，而不是抛异常。
+
+    本地 .env 里可能真有 key，这里临时清空再还原，保证这条在任何机器上
+    都能测到"没 key"这条路径 —— 否则有 key 的机器上它根本测不到降级。
+    """
+    old = generator.CONFIG.model_api_key
+    generator.CONFIG.model_api_key = ""
     try:
         check("未配 key 时 generate() 返回 None", generator.generate("测试问题", PASSAGES) is None)
     finally:
-        CONFIG.model_api_key = old
+        generator.CONFIG.model_api_key = old
 
 
 def test_prompt_contains_constraints():
@@ -84,24 +94,17 @@ def test_refusal_detection():
 
 def test_ask_endpoint_degrades():
     """/ask 在没配 key 时应当返回答案为空 + 说明，并且照常给出检索段落。"""
-    os.environ.setdefault("EMBED_BACKEND", "hash")
-    os.environ.setdefault("DATA_MODULE", "data")
-    # 配置是在 import 时读的，这里重新加载保证拿到上面的默认值
-    import config
-
-    importlib.reload(config)
     try:
         from fastapi.testclient import TestClient
         import main
-
-        importlib.reload(main)
     except Exception as e:  # noqa: BLE001
         print(f"SKIP  /ask 端点测试（{type(e).__name__}: {e}）")
         return
 
-    old = config.CONFIG.model_api_key
-    config.CONFIG.model_api_key = ""
-    main.CONFIG.model_api_key = ""
+    # 改 generator 拿着的那个 CONFIG 才有效：main 里调用的是 generator.generate，
+    # 它读的是自己模块里 import 进来的那个对象
+    old = generator.CONFIG.model_api_key
+    generator.CONFIG.model_api_key = ""
     try:
         with TestClient(main.app) as client:
             r = client.post("/ask", json={"query": "退货之后钱多久退回来？", "topk": 3})
@@ -111,8 +114,7 @@ def test_ask_endpoint_degrades():
         check("/ask 未配 key 时给出说明", bool(d.get("note")))
         check("/ask 未配 key 时仍有检索段落", len(d.get("passages", [])) > 0)
     finally:
-        config.CONFIG.model_api_key = old
-        main.CONFIG.model_api_key = old
+        generator.CONFIG.model_api_key = old
 
 
 if __name__ == "__main__":

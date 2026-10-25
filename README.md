@@ -134,6 +134,36 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 
 **还有个没敢下结论的观察**：重排在覆盖率上是掉的（混合 0.972 → 重排后 0.917），我猜是重排倾向于把同一法条的不同表述堆在前面，牺牲了多样性。但 -0.034 不显著，30 条上说不清。真要查得专门做多样性指标的实验，现在没做。
 
+## 生成层：到这里才是完整的 RAG
+
+`/retrieve` 只能把原文段落捞出来，用户还得自己读、自己拼。`/ask` 在上面接了一层大模型，把几段归纳成一段通顺的话，并且每句标出依据来自哪一段。
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"query": "如果被告人不服判决，有什么权利？", "topk": 3}'
+```
+
+```json
+{
+  "query": "如果被告人不服判决，有什么权利？",
+  "answer": "被告人或其近亲属如果不服判决，有权向上一级人民法院上诉 [1]。辩护人经被告人或者其近亲属同意，也可以提出上诉 [1]。",
+  "citations": [0, 978],
+  "refused": false,
+  "model": "qwen3.5-plus-2026-02-15",
+  "passages": [{"id": 0, "score": 0.9981, "text": "根据《刑事诉讼法》第294条……"}],
+  "usage": {"prompt_tokens": 564, "completion_tokens": 54, "total_tokens": 618}
+}
+```
+
+法律场景接生成有个绕不开的问题：**模型会编法条**。读完几段原文，它可能顺嘴给你造一个"根据《XX法》第XXX条"，编号是它自己想出来的，而且看着特别像真的。所以这块真正花心思的是两件事：
+
+**引用溯源。** 提示词要求每句话都标 `[编号]`，接口再把编号解析回真实段落 id 放进 `citations`，前端能点回去核对。模型偶尔会引用一个不存在的编号（给了 3 段它写 `[4]`），这种直接丢掉，不让它进引用列表 —— 引用是要给人点回去看的，指向空段落比不显示更糟。
+
+**敢拒答。** 资料里没有的就要求它原样输出"检索到的内容里没有相关规定"，不许推测、不许用常识补，也不许编造法条编号、罪名、期限这些具体数字。实测拿化妆品的段落去问刑事上诉和劳动仲裁，两次都老老实实拒答了，没编。
+
+没配 `MODEL_API_KEY` 的时候 `/ask` 不会报错，会退化成纯检索（`answer` 为 `null`，附一句说明）。跟这个项目其它地方一样，先把降级留好，别让环境卡住人。
+
 ## 几个设计上的选择
 
 **融合为什么用 RRF。** BM25 的分数是 TF-IDF 量纲，能到几十；向量相似度是 0~1。两边加起来之前得先归一化，而归一化系数对语料分布特别敏感，换批数据就得重调。RRF 只看名次，`score = Σ 1/(60 + rank)`，天生跨量纲，也不用调参。省事且稳。
@@ -176,6 +206,17 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 
 所以现在默认跑 1000 条（`EVAL_MAX=1000`），150 条只用来快速冒烟。**教训：指标差几个点的时候，先看样本量和置信区间，再下结论。样本小的时候，正确做法不是换个结论，是承认这个样本给不出结论。**
 
+**推理型模型默认会把思考过程一起吐出来。** 接生成层的时候第一次调用直接超时，我以为是网络问题，查下来不是：`qwen3.5-plus` 这类模型会先输出一大段 `reasoning_content` 再给答案。
+
+实测同一个问题，一个 46 字的答案配了 4286 字的思考过程：
+
+|              | 输出 token | 耗时    |
+| ------------ | --------: | ------- |
+| 开着思考模式  |     1434  | 28.5 秒 |
+| 关掉          |       30  | 3.3 秒  |
+
+**98% 的输出 token 和 89% 的时间都花在思考上**，而答案本身没什么区别 —— 因为这活儿是照着给定的资料归纳，不是推演。加上 `enable_thinking: false` 就好了，代码里默认关，`MODEL_ENABLE_THINKING=1` 可以打开。**教训：换模型后先看一眼 `usage` 里的 `reasoning_tokens`，数字很大说明它是推理型的，而且你正在为用不上的思考过程付费。**
+
 ## 环境变量
 
 复制 `.env.example` 改成 `.env` 就行，全部都有降级默认值，一个不配也能跑。
@@ -190,6 +231,14 @@ TARGET_ROWS=10000 python scripts/fetch_law_data.py
 | `DATA_MODULE`       | `data`                   | `data_law` 法律语料 / `data` 示例语料  |
 | `TOPK` / `EVAL_MAX` | `5` / `150`              | 返回条数 / 评测问句条数，正式跑建议 `EVAL_MAX=1000` |
 | `REUSE_INDEX`       | `1`                      | 库里已有同样条数时跳过重建，换语料要设 `0` |
+| `MODEL_API_BASE`    | DashScope 兼容模式        | 生成层接口，任何 OpenAI 兼容服务都行       |
+| `MODEL_API_KEY`     | 空                       | 空则 `/ask` 退化成纯检索                   |
+| `MODEL_NAME`        | `qwen-plus`              | 模型名，见下方说明                         |
+| `MODEL_ENABLE_THINKING` | `0`                  | 推理型模型是否输出思考过程，默认关          |
+| `MODEL_TIMEOUT`     | `120`                    | 生成超时秒数                               |
+| `PASSAGE_MAX_CHARS` | `600`                    | 送进提示词的每段正文最长字数                |
+
+配置除了环境变量，也支持写在 `.env` 里（`config.py` 自己解析，没引 python-dotenv）。两份都有的话**以环境变量为准**，方便临时换个模型试。注意 `.env` 在 `.gitignore` 里，key 不会跟着提交。
 
 ## 代码结构
 
@@ -199,7 +248,8 @@ embedding.py           嵌入层，含中文切分和 hash 兜底
 vectorstore.py         pgvector / 内存，两种向量库
 retrievers.py          BM25、向量、RRF 融合、重排
 cache.py               Redis 查询缓存
-main.py                FastAPI：/retrieve、/health、演示页
+main.py                FastAPI：/retrieve、/ask、/health、演示页
+generator.py           生成层：提示词拼装、chat/completions 调用、引用解析
 evaluate.py            四方案评测，输出 Recall@1/@5、MRR
 data_law.py            法律语料与评测集构建
 data.py                20 段示例语料
@@ -210,6 +260,7 @@ scripts/build_annotation_sheet.py   生成多 gold 标注表（把候选池捞�
 scripts/eval_multi_gold.py     用标好的多 gold 数据重新评测，跟单 gold 对照（带 bootstrap）
 annotation/sheet.md            30 条问句的人工标注结果，每行候选都留着
 tests/test_reuse_index.py   索引复用的测试，mock 掉数据库，不用 Docker 也能跑
+tests/test_generator.py     生成层测试，不联网不花钱
 init_db.sql            建表语句
 ```
 
@@ -217,6 +268,7 @@ init_db.sql            建表语句
 
 ```bash
 python tests/test_reuse_index.py
+python tests/test_generator.py
 ```
 
 ## 还没做
@@ -225,7 +277,7 @@ python tests/test_reuse_index.py
 - 检索多样性：重排后覆盖率下降是个没验证的猜测，得补专门的实验
 - 文本切分：现在直接拿整段回答当检索单元，长文档得上 chunk + overlap
 - 向量索引：HNSW 没开，语句在 `init_db.sql` 注释里。3000 段这规模全表扫描更快，开了反而慢
-- 生成环节：只做到检索层，没接 LLM 出答案，严格说现在是 R 不是完整的 RAG
+- 生成质量还没评：`/ask` 能出答案了，但答案对不对、引用标得准不准，现在没有任何量化。多 gold 那批标注正好可以用来做这件事（看答案覆盖了几个 gold），下一步打算做
 - 多租户：没做隔离
 
 ## License
