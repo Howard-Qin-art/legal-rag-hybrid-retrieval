@@ -33,5 +33,17 @@ class Config:
     # 换语料但条数恰好相同时，设 REUSE_INDEX=0 强制重建
     reuse_index: bool = os.getenv("REUSE_INDEX", "1") == "1"
 
+    # ---- 生成层（/ask）----
+    # 走 OpenAI 兼容的 chat/completions 接口，各家只要换 base 和模型名
+    model_api_base: str = os.getenv(
+        "MODEL_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    model_api_key: str = os.getenv("MODEL_API_KEY", "")  # 留空则 /ask 退化成纯检索
+    model_name: str = os.getenv("MODEL_NAME", "qwen-plus")
+    model_temperature: float = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
+    model_timeout: int = int(os.getenv("MODEL_TIMEOUT", "60"))
+    # 送进提示词的每段正文最长多少字，长了截断，省 token 也避免超出上下文
+    passage_max_chars: int = int(os.getenv("PASSAGE_MAX_CHARS", "600"))
+
 
 CONFIG = Config()
