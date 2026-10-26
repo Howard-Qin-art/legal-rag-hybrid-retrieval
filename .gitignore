@@ -7,6 +7,9 @@ venv/
 *.db
 *.sqlite3
 *.log
+# 审计日志：里面是真实的查询与回答，别跟着提交
+audit*.jsonl
+*.log.*
 .idea/
 .vscode/
 .DS_Store

@@ -75,5 +75,18 @@ class Config:
     # 送进提示词的每段正文最长多少字，长了截断，省 token 也避免超出上下文
     passage_max_chars: int = int(os.getenv("PASSAGE_MAX_CHARS", "600"))
 
+    # ---- 审计日志（main.py 的 /retrieve 与 /ask）----
+    # 每次请求落一行 JSONL。法律问答这类场景要求事后能查到"问了什么、答了什么、
+    # 依据哪几段"，没有留痕等于没有服务。设 AUDIT_ENABLED=0 关掉。
+    audit_enabled: bool = os.getenv("AUDIT_ENABLED", "1") == "1"
+    # 留空则写在项目根目录下 audit.jsonl
+    audit_log_path: str = os.getenv("AUDIT_LOG_PATH", "")
+
+    # ---- 输入约束（防止一个畸形请求拖死服务）----
+    # query 上限：超长输入会让嵌入模型跑很久，甚至把它撑爆，必须在入口拦掉
+    max_query_chars: int = int(os.getenv("MAX_QUERY_CHARS", "1000"))
+    # topk 上限：返回条数失控会把带宽和响应时间都拖垮
+    max_topk: int = int(os.getenv("MAX_TOPK", "20"))
+
 
 CONFIG = Config()

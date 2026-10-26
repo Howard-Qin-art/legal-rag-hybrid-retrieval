@@ -79,6 +79,7 @@ curl -X POST http://localhost:8000/retrieve \
 
 ```json
 {
+  "ok": true,
   "cached": false,
   "results": [{"id": 0, "score": 0.9981, "text": "根据《刑事诉讼法》第294条……"}],
   "latency_ms": 123.45,
@@ -166,6 +167,45 @@ curl -X POST http://localhost:8000/ask \
 
 没配 `MODEL_API_KEY` 的时候 `/ask` 不会报错，会退化成纯检索（`answer` 为 `null`，附一句说明）。跟这个项目其它地方一样，先把降级留好，别让环境卡住人。
 
+## 留痕这一层
+
+一开始这个项目连一行日志都没有。检索链路做得再漂亮，出了问题是复盘不了的：不知道用户问了什么、命中了哪几段、模型有没有拒答、慢在哪一步。法律问答尤其不该这样——同样一句话，今天和明天给出不同答案，没有记录就无从解释。
+
+所以加了 `audit.py`，每次请求往 JSONL 追加一行：
+
+```json
+{"ts": "2026-10-26T01:13:19+00:00", "endpoint": "retrieve", "query": "如果被告人不服判决？",
+ "topk": 3, "cached": false, "rerank": true, "hit_ids": [1, 3, 0], "top_score": 0.0323,
+ "latency_ms": 7.23}
+```
+
+`/ask` 会多记 `cited_ids`（答案实际引用了哪几段）、`refused`、`model` 和两个 token 数。攒够一批之后 `/stats` 直接给汇总：调用量、缓存命中率、平均与 p95 延迟、拒答数、错误数、token 消耗。
+
+选 JSONL 而不是数据库，是因为它 `tail`、`grep`、`jq` 都能直接读，不用为了看一眼刚才发生了什么先开个客户端。规模上去了再换列式存储。
+
+**被拒的请求也记。** 这条是补的：最早只有进到路由函数的请求才会写日志，而空 query、参数越界这类在 pydantic 那一层就被拦下了，压根到不了。`_handle_validation_error` 里补记一笔之后，日志里能看到 `endpoint: rejected` 的条目——有人在反复试探参数边界、某个调用方的字段格式总是不对，这些信号光看成功日志是发现不了的。
+
+写盘这块有三个处理：加锁串行（uvicorn 跑线程池，多线程追加同一个文件容易写出半行）、坏行跳过（进程被强杀会留半行 JSON，读的时候跳过而不是让 `/stats` 崩掉）、写失败安静返回 `False` 并往 stderr 说一句——日志是旁路，它挂了不该让检索跟着挂。
+
+## 输入这块不能敞着口
+
+接口层原本是直接把 `req.query` 往下传的，没有任何约束。这意味着几十万字的问题照样会进到嵌入模型里，把它拖死甚至撑爆；`topk` 传个负数会静默切片出错，还不报错。现在入口挡住了：
+
+| 输入 | 约束 | 超了怎么办 |
+| --- | --- | --- |
+| `query` | 过滤首尾空白后非空，≤ 1000 字 | 422 + `invalid_query` |
+| `topk` | 1 ~ 20 的整数 | 422 + `invalid_request` |
+
+顺带说一下为什么要 strip：不去掉首尾空白的话，「退货 」和「退货」会生成两个不同的缓存 key，同一句话被重复算一遍，缓存命中率也被稀释。
+
+错误处理统一成一个结构，前端按 `code` 分支，不用去解析 message 文本：
+
+```json
+{"ok": false, "error": {"code": "invalid_query", "message": "query 不能为空"}}
+```
+
+三个码：`invalid_query` 是输入不合规，`invalid_request` 是字段类型或范围不对，`internal_error` 是没预料到的。最后一个会在服务端打完整堆栈——排查需要，但对外只给错误码，内部路径、SQL、模型地址这些不出去。
+
 ## 几个设计上的选择
 
 **融合为什么用 RRF。** BM25 的分数是 TF-IDF 量纲，能到几十；向量相似度是 0~1。两边加起来之前得先归一化，而归一化系数对语料分布特别敏感，换批数据就得重调。RRF 只看名次，`score = Σ 1/(60 + rank)`，天生跨量纲，也不用调参。省事且稳。
@@ -239,6 +279,10 @@ curl -X POST http://localhost:8000/ask \
 | `MODEL_ENABLE_THINKING` | `0`                  | 推理型模型是否输出思考过程，默认关          |
 | `MODEL_TIMEOUT`     | `120`                    | 生成超时秒数                               |
 | `PASSAGE_MAX_CHARS` | `600`                    | 送进提示词的每段正文最长字数                |
+| `AUDIT_ENABLED`     | `1`                      | 是否落审计日志，设 `0` 关掉                 |
+| `AUDIT_LOG_PATH`    | 空                       | 留空则写在项目根目录 `audit.jsonl`         |
+| `MAX_QUERY_CHARS`   | `1000`                   | query 长度上限，超了返回 422               |
+| `MAX_TOPK`          | `20`                     | topk 上限，同时必须 ≥ 1                    |
 
 配置除了环境变量，也支持写在 `.env` 里（`config.py` 自己解析，没引 python-dotenv）。两份都有的话**以环境变量为准**，方便临时换个模型试。注意 `.env` 在 `.gitignore` 里，key 不会跟着提交。
 
@@ -250,8 +294,9 @@ embedding.py           嵌入层，含中文切分和 hash 兜底
 vectorstore.py         pgvector / 内存，两种向量库
 retrievers.py          BM25、向量、RRF 融合、重排
 cache.py               Redis 查询缓存
-main.py                FastAPI：/retrieve、/ask、/health、演示页
+main.py                FastAPI：/retrieve、/ask、/stats、/health、演示页
 generator.py           生成层：提示词拼装、chat/completions 调用、引用解析
+audit.py               审计：请求落 JSONL，/stats 汇总调用量、命中率、p95、拒答与错误
 evaluate.py            四方案评测，输出 Recall@1/@5、MRR
 data_law.py            法律语料与评测集构建
 data.py                20 段示例语料
@@ -263,6 +308,7 @@ scripts/eval_multi_gold.py     用标好的多 gold 数据重新评测，跟单 
 annotation/sheet.md            30 条问句的人工标注结果，每行候选都留着
 tests/test_reuse_index.py   索引复用的测试，mock 掉数据库，不用 Docker 也能跑
 tests/test_generator.py     生成层测试，不联网不花钱
+tests/test_audit_and_validation.py    审计日志与输入校验，覆盖 6 类畸形输入与内部异常降级
 init_db.sql            建表语句
 ```
 
@@ -271,6 +317,7 @@ init_db.sql            建表语句
 ```bash
 python tests/test_reuse_index.py
 python tests/test_generator.py
+python tests/test_audit_and_validation.py
 ```
 
 ## 还没做
@@ -279,7 +326,8 @@ python tests/test_generator.py
 - 检索多样性：重排后覆盖率下降是个没验证的猜测，得补专门的实验
 - 文本切分：现在直接拿整段回答当检索单元，长文档得上 chunk + overlap
 - 向量索引：HNSW 没开，语句在 `init_db.sql` 注释里。3000 段这规模全表扫描更快，开了反而慢
-- 生成质量还没评：`/ask` 能出答案了，但答案对不对、引用标得准不准，现在没有任何量化。多 gold 那批标注正好可以用来做这件事（看答案覆盖了几个 gold），下一步打算做
+- 生成质量还没评：`/ask` 能出答案了，但答案对不对、引用标得准不准，现在没有任何量化。多 gold 那批标注可以用来做这件事（看答案覆盖了几个 gold），审计日志落下来之后也有素材了，下一步打算做
+- 日志轮转：JSONL 会一直追加，长期跑要自己接 logrotate 或定期归档，没做
 - 多租户：没做隔离
 
 ## License
